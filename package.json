@@ -1,0 +1,1 @@
+{"dependencies":{"dotenv":"^16.4.5","express":"^4.19.2","googleapis":"^140.0.0"},"description":"Bot que registra automáticamente en Google Sheets los clientes que Oswaldo reporta por WhatsApp.","main":"server.js","name":"clientes-whatsapp-bot","scripts":{"start":"node server.js"},"version":"1.0.0"}
