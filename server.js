@@ -27,7 +27,7 @@ const {
   TWILIO_AUTH_TOKEN,
   TWILIO_WHATSAPP_FROM, // ej: whatsapp:+14155238886 (número sandbox de Twilio)
   LLM_API_KEY,
-  LLM_MODEL = 'llama-3.3-70b-versatile',
+  LLM_MODEL = 'openai/gpt-oss-20b', // Groq retiró llama-3.3-70b-versatile; se puede cambiar con la variable de entorno
   LLM_BASE_URL = 'https://api.groq.com/openai/v1',
   GOOGLE_SERVICE_ACCOUNT_JSON, // contenido del JSON de la cuenta de servicio (o ruta al archivo en uso local)
   SHEET_ID, // id de la hoja "Clientes"
@@ -102,20 +102,27 @@ async function sendMeta(to, text) {
 }
 
 // ---- Twilio WhatsApp sandbox (plan B) ----
+// Nota: la cuenta de prueba de Twilio no permite enviar mensajes libres de WhatsApp
+// (exige usar una plantilla aprobada), así que el aviso es "lo mejor posible": si
+// Twilio lo rechaza, se anota en el log y el registro en la hoja sigue funcionando.
 async function sendTwilio(to, text) {
-  const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Messages.json`;
-  const auth = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64');
-  const form = new URLSearchParams({
-    From: TWILIO_WHATSAPP_FROM,
-    To: `whatsapp:${to}`,
-    Body: text.slice(0, 1600),
-  });
-  const resp = await fetch(url, {
-    method: 'POST',
-    headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: form,
-  });
-  if (!resp.ok) throw new Error(`Twilio ${resp.status}: ${(await resp.text()).slice(0, 200)}`);
+  try {
+    const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Messages.json`;
+    const auth = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64');
+    const form = new URLSearchParams({
+      From: TWILIO_WHATSAPP_FROM,
+      To: `whatsapp:${to}`,
+      Body: text.slice(0, 1600),
+    });
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: form,
+    });
+    if (!resp.ok) throw new Error(`Twilio ${resp.status}: ${(await resp.text()).slice(0, 200)}`);
+  } catch (e) {
+    console.error('Aviso por WhatsApp no enviado (cuenta trial):', e.message);
+  }
 }
 
 // ---- IA: entender el reporte ----
@@ -154,20 +161,38 @@ REGLAS:
 
 Mensaje de Oswaldo: """${text}"""`;
 
-  const resp = await fetch(`${LLM_BASE_URL}/chat/completions`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${LLM_API_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: LLM_MODEL,
-      messages: [{ role: 'user', content: prompt }],
-      temperature: 0.1, max_tokens: 600,
-      response_format: { type: 'json_object' },
-    }),
-  });
-  if (!resp.ok) throw new Error(`LLM ${resp.status}: ${(await resp.text()).slice(0, 200)}`);
-  const data = await resp.json();
-  const raw = (data.choices && data.choices[0] && data.choices[0].message.content || '').trim();
-  return JSON.parse(raw);
+  // Groq retira modelos viejos sin aviso; probar en orden hasta que uno responda.
+  const models = [LLM_MODEL, 'llama-3.1-8b-instant', 'openai/gpt-oss-120b']
+    .filter((m, i, a) => m && a.indexOf(m) === i); // sin duplicados
+  let lastErr = null;
+  for (const model of models) {
+    let resp;
+    try {
+      resp = await fetch(`${LLM_BASE_URL}/chat/completions`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${LLM_API_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: 'user', content: prompt }],
+          temperature: 0.1, max_tokens: 600,
+          response_format: { type: 'json_object' },
+        }),
+      });
+    } catch (e) { lastErr = e; continue; }
+    if (!resp.ok) {
+      const t = (await resp.text()).slice(0, 200);
+      lastErr = new Error(`LLM ${resp.status}: ${t}`);
+      if (resp.status === 404 || /model_not_found|does not exist/i.test(t)) {
+        console.error(`Modelo IA retirado (${model}); probando el siguiente...`);
+        continue;
+      }
+      throw lastErr;
+    }
+    const data = await resp.json();
+    const raw = (data.choices && data.choices[0] && data.choices[0].message.content || '').trim();
+    return JSON.parse(raw);
+  }
+  throw lastErr || new Error('LLM sin respuesta');
 }
 
 const seen = new Set(); // ids de mensajes ya procesados
