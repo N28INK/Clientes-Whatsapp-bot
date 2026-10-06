@@ -288,6 +288,64 @@ if (HAS_TWILIO) {
   });
 }
 
-app.get('/health', (req, res) => res.send('ok'));
+// ---- Polling de Twilio (plan B sin webhook) ----
+// Twilio quitó la página "Sandbox settings" donde se pegaba el webhook de
+// mensajes entrantes, así que el bot va a buscar los mensajes nuevos
+// directamente a la API de Twilio cada cierto tiempo.
+const TWILIO_POLL_MS = Number(process.env.TWILIO_POLL_MS || 60000);
+let twilioPolling = false;
+const digitsOnly = (s) => String(s || '').replace(/\D/g, '');
 
-app.listen(PORT, () => console.log(`Bot WhatsApp -> Sheets en el puerto ${PORT} (Meta: ${HAS_META ? 'sí' : 'no'}, Twilio: ${HAS_TWILIO ? 'sí' : 'no'})`));
+async function pollTwilio(markOnly = false) {
+  if (!HAS_TWILIO || twilioPolling) return;
+  twilioPolling = true;
+  try {
+    const myNumber = digitsOnly(TWILIO_WHATSAPP_FROM);
+    const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Messages.json?PageSize=20`;
+    const auth = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64');
+    const resp = await fetch(url, { headers: { Authorization: `Basic ${auth}` } });
+    if (!resp.ok) throw new Error(`Twilio poll HTTP ${resp.status}`);
+    const data = await resp.json();
+    const msgs = (data.messages || [])
+      .filter((m) => m.direction === 'inbound'
+        && String(m.from || '').startsWith('whatsapp:')
+        && digitsOnly(m.to) === myNumber)
+      .sort((a, b) => new Date(a.date_created) - new Date(b.date_created));
+    for (const m of msgs) {
+      const id = `twilio-${m.sid}`;
+      if (seen.has(id)) continue;
+      if (markOnly) continue; // al arrancar: solo marcar como vistos, no reprocesar
+      const from = String(m.from).replace(/^whatsapp:/, '');
+      const body = (m.body || '').trim();
+      if (!from || !body) continue;
+      if (/^join\s/i.test(body)) continue; // mensajes de unión al sandbox, ignorar
+      console.log(`Poll Twilio: nuevo mensaje de ${from}`);
+      try { await handleText(from, body, id, sendTwilio); }
+      catch (e) { console.error('Error procesando mensaje:', e.message); }
+    }
+    // Evitar que la memoria de vistos crezca sin límite
+    if (seen.size > 2000) {
+      const it = seen.values();
+      for (let i = 0; i < 1000; i++) seen.delete(it.next().value);
+    }
+  } catch (e) {
+    console.error('Error en poll Twilio:', e.message);
+  } finally {
+    twilioPolling = false;
+  }
+}
+
+app.get('/health', (req, res) => {
+  res.send('ok');
+  if (HAS_TWILIO) pollTwilio(false); // cada visita también revisa mensajes nuevos
+});
+
+app.listen(PORT, () => {
+  console.log(`Bot WhatsApp -> Sheets en el puerto ${PORT} (Meta: ${HAS_META ? 'sí' : 'no'}, Twilio: ${HAS_TWILIO ? 'sí' : 'no'})`);
+  if (HAS_TWILIO) {
+    pollTwilio(true).then(() => {
+      console.log(`Poll Twilio activo cada ${TWILIO_POLL_MS / 1000}s`);
+      setInterval(() => pollTwilio(false), TWILIO_POLL_MS);
+    });
+  }
+});
